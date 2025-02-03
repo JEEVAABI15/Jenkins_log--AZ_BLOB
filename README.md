@@ -1,8 +1,7 @@
-# Jenkins Logs Fetch and Upload to Azure Blob Storage
-
+# Jenkins Logs Upload to Azure Blob Storage
 ## Overview
 
-This script retrieves logs from the latest builds of all Jenkins jobs and uploads them to Azure Blob Storage. It requires Jenkins credentials and an Azure Storage account for storing logs.
+This script automates the process of fetching Jenkins build logs and uploading them to an Azure Blob Storage container. It ensures that only new logs are uploaded, avoiding duplicate uploads.
 
 ## Prerequisites
 
@@ -13,6 +12,7 @@ Ensure the following dependencies are installed on your system:
 - **Azure CLI** (For interacting with Azure Blob Storage)
 - **cURL** (For API requests)
 - **jq** (Optional, for JSON parsing)
+- Network access to Jenkins and Azure Storage
 
 ## Installation
 
@@ -49,18 +49,33 @@ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 ### 3. Install Azure CLI
 
 ```bash
+sudo apt update && sudo apt install -y jq
 curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
 ```
+```bash
+az login
+```
+```bash
+az storage account keys list --account-name <your-storage-account>
+```
+## State and Log Files
+
+- **STATE_FILE:** Keeps track of uploaded builds (/tmp/uploaded_builds.txt by default)
+
+- **LOG_FILE:** Logs script execution (./jenkins_blob_upload.log by default)
+
 
 ## Script Details
 
 The script performs the following:
 
-- Fetches all Jenkins jobs
-- Retrieves the latest build number for each job
-- Downloads the build logs
-- Uploads the logs to Azure Blob Storage
-- Deletes local log files after upload
+- Retrieves a list of all Jenkins jobs
+- Iterates through each job to find its build numbers
+- Fetches logs for each build
+- Checks if the log has already been uploaded
+- Uploads the log file to Azure Blob Storage
+- Marks the build as uploaded in STATE_FILE
+- Cleans up temporary log files
 
 ## Script: `fetch_jenkins_logs.sh`
 
@@ -74,41 +89,82 @@ AZURE_ACCOUNT_NAME="<your-azure-account-name>"
 AZURE_CONTAINER_NAME="jenkinslogs"
 AZURE_CONNECTION_STRING="<your-azure-connection-string>"
 
-# Get the list of Jenkins jobs
-jobs=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/api/json" | grep -oP '"name":"\K[^"]+')
-echo "Jobs found:"
-echo "$jobs"
+# File to keep track of uploaded builds
+STATE_FILE="/tmp/uploaded_builds.txt"
+LOG_FILE="./jenkins_blob_upload.log"
 
-fetch_latest_build_number() {
-  local job_name="$1"
-  if command -v jq &> /dev/null; then
-    curl -s --fail -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/job/$job_name/lastBuild/api/json" | \
-      jq -r '.number'
-  else
-    curl -s --fail -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/job/$job_name/lastBuild/api/json" | \
-      grep -oP '"number":\K[0-9]+' | head -n 1
-  fi
+# Ensure state & log files exist
+touch "$STATE_FILE"
+touch "$LOG_FILE"
+
+# Function to log messages with timestamps
+log() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
 
+log "Starting Jenkins log upload script..."
+
+# Get list of all jobs
+jobs=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/api/json" | jq -r '.jobs[].name')
+
+if [ -z "$jobs" ]; then
+    log "Error: No jobs found or Jenkins API is down!"
+    exit 1
+fi
+
+# Loop through each job
 for job in $jobs; do
-  echo "Processing job: $job"
-  build_number=$(fetch_latest_build_number "$job")
-  if [ -n "$build_number" ]; then
-    console_url="$JENKINS_URL/job/$job/$build_number/consoleText"
-    log_content=$(curl -s --fail -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$console_url")
-    if [ -n "$log_content" ]; then
-      log_file="${job}-build-${build_number}.log"
-      echo "$log_content" > "$log_file"
-      az storage blob upload \
-        --account-name $AZURE_ACCOUNT_NAME \
-        --container-name $AZURE_CONTAINER_NAME \
-        --file "$log_file" \
-        --name "$log_file" \
-        --connection-string "$AZURE_CONNECTION_STRING"
-      rm "$log_file"
+    log "Fetching logs for job: $job"
+
+    # Get all build numbers for the job
+    build_numbers=$(curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/job/$job/api/json" | jq -r '.builds[].number')
+
+    if [ -z "$build_numbers" ]; then
+        log "No builds found for job: $job"
+        continue
     fi
-  fi
+
+    # Loop through each build and fetch logs
+    for build_number in $build_numbers; do
+        BUILD_IDENTIFIER="${job}-${build_number}"
+        TEMP_LOG_FILE="/tmp/${BUILD_IDENTIFIER}.log"
+
+        # Check if this build has already been uploaded
+        if grep -q "$BUILD_IDENTIFIER" "$STATE_FILE"; then
+            log "Skipping already uploaded log: $BUILD_IDENTIFIER"
+            continue
+        fi
+
+        log "Fetching logs for Build #$build_number of $job..."
+
+        # Fetch log
+        curl -s -u "$JENKINS_USER:$JENKINS_API_TOKEN" "$JENKINS_URL/job/$job/$build_number/consoleText" > "$TEMP_LOG_FILE"
+
+        if [ ! -s "$TEMP_LOG_FILE" ]; then
+            log "Warning: Log for $BUILD_IDENTIFIER is empty or missing!"
+            rm -f "$TEMP_LOG_FILE"
+            continue
+        fi
+
+        # Upload to Azure Blob Storage
+        az storage blob upload \
+            --connection-string "$AZURE_CONNECTION_STRING" \
+            --container-name "$AZURE_CONTAINER_NAME" \
+            --name "$(basename $TEMP_LOG_FILE)" \
+            --file "$TEMP_LOG_FILE" \
+            --overwrite
+
+        log "Uploaded log: $BUILD_IDENTIFIER"
+
+        # Mark as uploaded
+        echo "$BUILD_IDENTIFIER" >> "$STATE_FILE"
+
+        # Remove the temp file
+        rm -f "$TEMP_LOG_FILE"
+    done
 done
+
+log "Script execution completed!"
 ```
 
 ## Execution
@@ -116,9 +172,13 @@ done
 Run the script using:
 
 ```bash
-bash fetch_jenkins_logs.sh
+bash ./fetch_jenkins_logs.sh
 ```
+Check logs:
 
+```bash
+cat jenkins_blob_upload.log
+```
 ## Troubleshooting
 
 ### Error: "Unauthorized"
@@ -134,4 +194,7 @@ bash fetch_jenkins_logs.sh
 ## Conclusion
 
 This setup automates Jenkins log retrieval and storage in Azure. You can further integrate it with monitoring tools for centralized log analysis.
+
+
+
 

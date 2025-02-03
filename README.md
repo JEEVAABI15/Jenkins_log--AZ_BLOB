@@ -40,7 +40,7 @@ sudo cat /var/lib/jenkins/secrets/initialAdminPassword
 
 ### 2. Configure Jenkins API Token
 
-1. Login to Jenkins (`http://<jenkins-ip>:8080`)
+1. Login to Jenkins (`http://<jenkins-ip>:8080`) `http://135.232.107.176:8080`
 2. Click on **your username** (top-right corner) > **Configure**
 3. Scroll down to **API Token**
 4. Click **Add new Token**, provide a name, and click **Generate**

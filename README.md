@@ -10,7 +10,6 @@ Ensure the following dependencies are installed on your system:
 - **Jenkins** (Running on a VM)
 - **Jenkins API Token** (Generated from Jenkins User Profile)
 - **Azure CLI** (For interacting with Azure Blob Storage)
-- **cURL** (For API requests)
 - **jq** (Optional, for JSON parsing)
 - Network access to Jenkins and Azure Storage
 
